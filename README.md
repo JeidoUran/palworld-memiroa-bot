@@ -1,0 +1,1 @@
+# palworld-map-bot
