@@ -45,13 +45,9 @@ const OUTPUT_SIZE = 4096;
 //  (  -1856.02, -148615.58) -> ( -668, -266)
 //  (-558096.00,  120982.28) -> (  -81,  946)
 const WORLD_TO_MAP = {
-  ax: 5.524224942465329e-7,
-  bx: 0.0021784537692483147,
-  cx: -344.2520005706483,
-
-  dx: -0.002179134342055822,
-  ex: -4.51995022687495e-7,
-  fx: -270.0617622470461,
+  transl_x: 123888,
+  transl_y: 158000,
+  scale: 459,
 };
 
 // 2) map -> pixel (déduit de tes correspondances map_pos -> pixels sur l'image 8192)
@@ -72,15 +68,19 @@ const MAP_TO_PX = {
   D: 3233.9698454713814,
 };
 
-// Clamp doux pour éviter que sharp hurle si jamais tu as un point ultra hors-map
-function clamp(v, min, max) {
-  return Math.max(min, Math.min(max, v));
-}
-
 function worldToMap(worldX, worldY) {
-  const mX = WORLD_TO_MAP.ax * worldX + WORLD_TO_MAP.bx * worldY + WORLD_TO_MAP.cx;
-  const mY = WORLD_TO_MAP.dx * worldX + WORLD_TO_MAP.ex * worldY + WORLD_TO_MAP.fx;
-  return { mapX: mX, mapY: mY };
+  // équivalent palworld_coord.sav_to_map(..., new=False)
+  // newX = x + transl_x
+  // newY = y - transl_y
+  // mapX = newY / scale
+  // mapY = newX / scale
+  const newX = worldX + WORLD_TO_MAP.transl_x;
+  const newY = worldY - WORLD_TO_MAP.transl_y;
+
+  return {
+    mapX: newY / WORLD_TO_MAP.scale,
+    mapY: newX / WORLD_TO_MAP.scale,
+  };
 }
 
 function mapToPixel(mapX, mapY) {
@@ -105,12 +105,30 @@ const ASSETS = {
 };
 
 let iconCache = null;
-function loadIconsOnce() {
+
+async function loadIconsOnce() {
   if (iconCache) return iconCache;
+
+  const CAMP_SIZE = 128;
+  const PLAYER_SIZE = 112;
+
+  const camp = await sharp(ASSETS.camp)
+    .resize(CAMP_SIZE, CAMP_SIZE, { fit: "fill", kernel: sharp.kernel.nearest })
+    .png()
+    .toBuffer();
+
+  const player = await sharp(ASSETS.player)
+    .resize(PLAYER_SIZE, PLAYER_SIZE, { fit: "fill", kernel: sharp.kernel.nearest })
+    .png()
+    .toBuffer();
+
   iconCache = {
-    camp: fs.readFileSync(ASSETS.camp),
-    player: fs.readFileSync(ASSETS.player),
+    camp,
+    player,
+    CAMP_SIZE,
+    PLAYER_SIZE,
   };
+
   return iconCache;
 }
 
@@ -240,22 +258,22 @@ function makeLabelSvgSmall(text) {
   const t = escapeXml(text);
   const paddingX = 8;
   const paddingY = 4;
-  const fontSize = 14;
+  const fontSize = 18;
 
-  const textWidth = Math.max(40, t.length * 7);
+  const textWidth = Math.max(60, t.length * 7);
   const w = textWidth + paddingX * 2;
   const h = fontSize + paddingY * 2 + 2;
 
   return Buffer.from(`
 <svg width="${w}" height="${h}" xmlns="http://www.w3.org/2000/svg">
-  <rect x="0" y="0" width="${w}" height="${h}" rx="6" ry="6" fill="rgba(0,0,0,0.65)"/>
+  <rect x="0" y="0" width="${w}" height="${h}" rx="6" ry="6" fill="rgba(0,0,0,0.75)"/>
   <text x="${paddingX}" y="${fontSize + paddingY}" font-family="Arial, sans-serif"
-        font-size="${fontSize}" fill="white">${t}</text>
+        font-size="${fontSize}" font-weight="bold" fill="white">${t}</text>
 </svg>`);
 }
 
 async function renderSnapshot({ players, camps }) {
-  const { camp, player } = loadIconsOnce();
+  const icons = await loadIconsOnce();
 
   // 1) lire la map source
   const baseSrc = sharp(ASSETS.map);
@@ -280,11 +298,9 @@ async function renderSnapshot({ players, camps }) {
     const x = px * sx;
     const y = py * sy;
 
-    // IMPORTANT: size doit être en pixels de sortie
-    const size = 18;
-
+    const size = icons.CAMP_SIZE;
     composites.push({
-      input: camp,
+      input: icons.camp,
       left: Math.round(x - size / 2),
       top: Math.round(y - size / 2),
     });
@@ -300,19 +316,18 @@ async function renderSnapshot({ players, camps }) {
     const x = px * sx;
     const y = py * sy;
 
-    const size = 22;
-
+    const size = icons.PLAYER_SIZE;
     composites.push({
-      input: player,
+      input: icons.player,
       left: Math.round(x - size / 2),
-      top: Math.round(y - size / 2),
+      top: Math.round(y - size),
     });
 
     const labelSvg = makeLabelSvgSmall(p.name ?? p.nickname ?? "Player");
     composites.push({
       input: labelSvg,
       left: Math.round(x + 12),
-      top: Math.round(y - 12),
+      top: Math.round(y - 56),
     });
   }
 
@@ -507,9 +522,6 @@ client.on("interactionCreate", async (interaction) => {
 
 client.once(Events.ClientReady, async () => {
   console.log(`Logged as ${client.user.tag}`);
-  console.log(`[palmap] base map: ${ASSETS.map}`);
-  console.log(`[palmap] world->map:`, WORLD_TO_MAP);
-  console.log(`[palmap] map->px:`, MAP_TO_PX);
 
   await tick();
   setInterval(() => tick(), INTERVAL_MINUTES * 60 * 1000);
