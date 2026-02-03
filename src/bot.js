@@ -34,6 +34,8 @@ const INTERVAL_MINUTES = Number(process.env.INTERVAL_MINUTES ?? 10);
 const MAP_IMAGE = process.env.MAP_IMAGE;
 const OUTPUT_SIZE = 4096;
 
+const LEGEND_SCALE = 2.5; // x2
+
 // ====== GUILD COLORS ======
 const GUILD_COLORS = [
   "#ff0000", // rouge
@@ -75,34 +77,12 @@ function pickColorForGuild(palGuildId, state) {
 }
 
 // ====== COORDS / CALIBRATION ======
-//
-// 1) world -> map (déduit de tes couples joueurs world<->map)
-//
-// mapX ≈ ax*worldX + bx*worldY + cx
-// mapY ≈ dx*worldX + ex*worldY + fx
-//
-// Coeffs issus d'un fit sur:
-//  (-599707.69, -360077.13) -> (-1129, 1037)
-//  (  35266.16,  321438.91) -> (  356, -347)
-//  (  -1856.02, -148615.58) -> ( -668, -266)
-//  (-558096.00,  120982.28) -> (  -81,  946)
 const WORLD_TO_MAP = {
   transl_x: 123888,
   transl_y: 158000,
   scale: 459,
 };
 
-// 2) map -> pixel (déduit de tes correspondances map_pos -> pixels sur l'image 8192)
-//
-// px ≈ A*mapX + B
-// py ≈ C*mapY + D
-//
-// Points utilisés:
-// map(-589.057,  276.500) -> px(3546), py(2518)
-// map( 399.670, -467.508) -> px(6110), py(4447)
-// map(-556.759,   10.149) -> px(3628), py(3206)
-// map( 419.385, -317.217) -> px(6163), py(4057)
-// map(-1123.327,-1036.224)-> px(2158), py(5925)
 const MAP_TO_PX = {
   A: 2.5953628006591515,
   B: 5073.702848050116,
@@ -111,11 +91,6 @@ const MAP_TO_PX = {
 };
 
 function worldToMap(worldX, worldY) {
-  // équivalent palworld_coord.sav_to_map(..., new=False)
-  // newX = x + transl_x
-  // newY = y - transl_y
-  // mapX = newY / scale
-  // mapY = newX / scale
   const newX = worldX + WORLD_TO_MAP.transl_x;
   const newY = worldY - WORLD_TO_MAP.transl_y;
 
@@ -154,10 +129,8 @@ const tintedCache = {
 };
 
 async function getTintedIcon(basePath, size, colorHex) {
-  // colorHex => key
   const key = colorHex.toLowerCase();
 
-  // on choisit quel cache utiliser en fonction du fichier
   const cache =
     basePath === ASSETS.camp ? tintedCache.camp :
     basePath === ASSETS.player ? tintedCache.player :
@@ -167,7 +140,7 @@ async function getTintedIcon(basePath, size, colorHex) {
 
   const buf = await sharp(basePath)
     .resize(size, size, { fit: "fill", kernel: sharp.kernel.nearest })
-    .tint(colorHex) // teinte toute l'icône
+    .tint(colorHex)
     .png()
     .toBuffer();
 
@@ -189,19 +162,6 @@ async function loadIconsOnce() {
 const STATE_DIR = path.resolve(__dirname, "../state");
 const STATE_FILE = path.join(STATE_DIR, "palmap-state.json");
 
-/**
- * State format:
- * {
- *   "guilds": {
- *     "<guildId>": {
- *       "channelId": "...",
- *       "messageId": "...",
- *       "lastHash": "...",
- *       "lastUpdatedAt": "ISO..."
- *     }
- *   }
- * }
- */
 function ensureStateDir() {
   if (!fs.existsSync(STATE_DIR)) fs.mkdirSync(STATE_DIR, { recursive: true });
 }
@@ -261,7 +221,6 @@ function extractCamps(guildsJson) {
         map_x: (typeof c.map_pos?.x === "number") ? c.map_pos.x : null,
         map_y: (typeof c.map_pos?.y === "number") ? c.map_pos.y : null,
 
-        // debug
         world_x: c.world_pos?.x ?? null,
         world_y: c.world_pos?.y ?? null,
       });
@@ -326,7 +285,62 @@ function makeLabelSvgSmall(text) {
 </svg>`);
 }
 
-async function renderSnapshot({ players, camps, playerToGuild, state }) {
+function hexToRgb(hex) {
+  const h = String(hex ?? "").replace("#", "").trim();
+  if (h.length !== 6) return { r: 255, g: 255, b: 255 };
+  return {
+    r: parseInt(h.slice(0, 2), 16),
+    g: parseInt(h.slice(2, 4), 16),
+    b: parseInt(h.slice(4, 6), 16),
+  };
+}
+
+function makeLegendSvg(legendGuilds, scale = 1) {
+  // layout base (avant scale)
+  const pad = 14;
+  const rowH = 28;
+  const titleH = 24;
+  const dotR = 7;
+
+  const w = 340;
+  const h = pad * 2 + titleH + legendGuilds.length * rowH;
+
+  const rows = legendGuilds.map((g, i) => {
+    const y = pad + titleH + i * rowH + 18;
+
+    const { r, g: gg, b } = hexToRgb(g.color);
+    const name = escapeXml(g.name ?? "Guild");
+    const count = Number(g.campCount ?? 0);
+
+    return `
+      <circle cx="${pad + dotR}" cy="${y - 6}" r="${dotR}" fill="rgb(${r},${gg},${b})" />
+      <text x="${pad + dotR * 2 + 10}" y="${y}" font-family="Arial, sans-serif"
+            font-size="16" font-weight="700" fill="white">${name}</text>
+      <text x="${w - pad}" y="${y}" text-anchor="end" font-family="Arial, sans-serif"
+            font-size="16" font-weight="700" fill="white">${count}</text>
+    `;
+  }).join("\n");
+
+  // SVG final: on scale tout le contenu (sans flou)
+  const scaledW = Math.round(w * scale);
+  const scaledH = Math.round(h * scale);
+
+  return {
+    buf: Buffer.from(`
+<svg width="${scaledW}" height="${scaledH}" xmlns="http://www.w3.org/2000/svg">
+  <g transform="scale(${scale})">
+    <rect x="0" y="0" width="${w}" height="${h}" rx="14" ry="14" fill="rgba(0,0,0,0.55)"/>
+    <text x="${pad}" y="${pad + 18}" font-family="Arial, sans-serif"
+          font-size="16" font-weight="800" fill="white">Guildes (bases)</text>
+    ${rows}
+  </g>
+</svg>`),
+    w: scaledW,
+    h: scaledH,
+  };
+}
+
+async function renderSnapshot({ players, camps, playerToGuild, legendGuilds, state }) {
   const icons = await loadIconsOnce();
 
   // 1) lire la map source
@@ -379,7 +393,6 @@ async function renderSnapshot({ players, camps, playerToGuild, state }) {
     const pid = normalizePalId(p.playerId ?? p.player_id ?? "");
     const palGuildId = playerToGuild?.[pid] ?? null;
 
-    // Si pas de guilde trouvée, couleur neutre
     const color = palGuildId ? pickColorForGuild(palGuildId, state) : "#FFFFFF";
     const playerIcon = await getTintedIcon(ASSETS.player, size, color);
 
@@ -394,6 +407,17 @@ async function renderSnapshot({ players, camps, playerToGuild, state }) {
       input: labelSvg,
       left: Math.round(x + 12),
       top: Math.round(y - 56),
+    });
+  }
+
+  // Legend (bottom-right)
+  if (Array.isArray(legendGuilds) && legendGuilds.length) {
+    const { buf: legendSvg, w: legendW, h: legendH } = makeLegendSvg(legendGuilds, LEGEND_SCALE);
+
+    composites.push({
+      input: legendSvg,
+      left: OUTPUT_SIZE - legendW - 24,
+      top: OUTPUT_SIZE - legendH - 24,
     });
   }
 
@@ -446,8 +470,10 @@ async function doUpdateForGuild(guildId, cfg, state, data, { force = false } = {
     players: data.players,
     camps: data.camps,
     playerToGuild: data.playerToGuild,
+    legendGuilds: data.legendGuilds,
     state, // <= important: pour persister les couleurs
   });
+
   const file = new AttachmentBuilder(buf, { name: "palworld-map.jpg" });
   const embed = makePalmapEmbed({
     playersCount: data.players.length,
@@ -473,7 +499,6 @@ function buildPlayerToGuildMap(guildsJson) {
     for (const memberId of (g.members ?? [])) {
       map[normalizePalId(memberId)] = guildId;
     }
-    // au cas où, on ajoute aussi l'admin.id (souvent déjà dans members)
     if (g.admin?.id) {
       map[normalizePalId(g.admin.id)] = guildId;
     }
@@ -490,10 +515,27 @@ async function fetchSnapshotData() {
 
   const playerToGuild = buildPlayerToGuildMap(guildsJson);
 
+  // ✅ LEGEND: on utilise les couleurs persistées (state) via pickColorForGuild
+  // Note: on ne filtre que les guildes avec au moins 1 base
+  const state = loadState();
+  const legendGuilds = Object.entries(guildsJson)
+    .map(([gid, g]) => ({
+      id: gid,
+      name: g.name,
+      campCount: g.camp_count ?? 0,
+      color: pickColorForGuild(gid, state),
+    }))
+    .filter(g => g.campCount > 0)
+    .sort((a, b) => (b.campCount - a.campCount) || a.name.localeCompare(b.name));
+
+  // ⚠️ pickColorForGuild peut avoir modifié le state (persist),
+  // donc on resave au cas où (même si pickColorForGuild le fait déjà)
+  saveState(state);
+
   const hashPayload = stableSnapshotForHash(players, camps);
   const hash = sha256(hashPayload);
 
-  return { players, camps, playerToGuild, guildsJson, hash };
+  return { players, camps, playerToGuild, guildsJson, legendGuilds, hash };
 }
 
 async function tick({ forceGuildId = null } = {}) {
@@ -511,7 +553,10 @@ async function tick({ forceGuildId = null } = {}) {
       if (!cfg?.channelId) continue;
       if (forceGuildId && guildId !== forceGuildId) continue;
 
-      await doUpdateForGuild(guildId, cfg, state, data, {
+      // IMPORTANT: on recharge state ici pour doUpdateForGuild (colors etc.)
+      const freshState = loadState();
+
+      await doUpdateForGuild(guildId, cfg, freshState, data, {
         force: forceGuildId === guildId,
       }).catch(err => console.error(`Update error guild ${guildId}:`, err));
     }
@@ -527,21 +572,9 @@ function makePalmapEmbed({ playersCount, campsCount, force = false }) {
     .setTitle("🗺️ Memiroa — Live Map")
     .setColor(playersCount > 0 ? 0x3BA55D : 0x747F8D)
     .addFields(
-      {
-        name: "Joueurs",
-        value: `${playersCount}/20`,
-        inline: true,
-      },
-      {
-        name: "Bases",
-        value: `${campsCount}`,
-        inline: true,
-      },
-      {
-        name: "\u200B", // spacer invisible pour bien centrer sur desktop
-        value: "\u200B",
-        inline: true,
-      }
+      { name: "Joueurs", value: `${playersCount}/20`, inline: true },
+      { name: "Bases", value: `${campsCount}`, inline: true },
+      { name: "\u200B", value: "\u200B", inline: true }
     )
     .setFooter({ text: "Memiroa Bot • Mise à jour automatique" })
     .setTimestamp(new Date());
@@ -619,7 +652,7 @@ client.on("interactionCreate", async (interaction) => {
   if (sub === "force") {
     const cfg = state.guilds[guildId];
     if (!cfg?.channelId) {
-      await interaction.reply({ content: "Aucune live-map attachée. Fais `/palmap add #canal` d’abord.", ephemeral: true });
+      await interaction.reply({ content: "Aucune live-map attachée. Fais \`/palmap add #canal\` d’abord.", ephemeral: true });
       return;
     }
 
