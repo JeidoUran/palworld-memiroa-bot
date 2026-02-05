@@ -90,3 +90,5 @@ typings/
 .vscode/
 
 state/palmap-state.json
+
+.yarn/
